@@ -160,7 +160,20 @@ def main() -> int:
         default="ratio",
         help="Sort table by: name, ratio (compression), saved (data saved), score (VMAF) (default: ratio)",
     )
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="Write results to file (plain text)",
+    )
     args = parser.parse_args()
+
+    # Disable progress bar when writing to file (cleaner output)
+    if args.output is not None:
+        args.no_progress = True
+
     console = Console()
 
     if args.jobs < 1:
@@ -277,6 +290,20 @@ def main() -> int:
         )
 
     console.print(table)
+
+    # Write to output file if requested
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.output, "w") as f:
+            out_console = Console(file=f, no_color=True, force_terminal=False)
+            out_console.print()
+            out_console.print(
+                "VMAF Scale (0–100): 100 = identical to source | 93+ = perceptually transparent | "
+                "80–93 = good | 60–80 = fair | <60 = poor"
+            )
+            out_console.print()
+            out_console.print(table)
+
     return 0
 
 

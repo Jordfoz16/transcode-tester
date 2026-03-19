@@ -45,6 +45,7 @@ python vmaf_compare.py samples/base.mkv samples/transcoded/
 - `--no-progress` – Disable the progress bar (useful when piping output)
 - `--jobs`, `-j` – Number of parallel VMAF jobs (default: 1). Increase to test multiple files simultaneously.
 - `--sort` – Sort table by `name`, `ratio`, `saved`, or `score` (default: `ratio`)
+- `--output`, `-o` – Write results to a file (plain text)
 
 ## Output
 
@@ -61,3 +62,26 @@ The script shows:
    - **VMAF Score** – Quality score (0–100)
 
 Results are sorted by compression ratio by default; use `--sort` to sort by name, data saved, or VMAF score.
+
+## Docker
+
+Build the image:
+
+```bash
+docker build -t vmaf-compare .
+```
+
+Run with volume mounts for the source file, transcoded folder, and output directory:
+
+```bash
+docker run --rm \
+  -v "$(pwd)/samples:/input:ro" \
+  -v "$(pwd)/output:/output" \
+  vmaf-compare \
+  /input/base.mkv /input/transcoded/codec/ \
+  --output /output/results.txt
+```
+
+- **Source file**: First argument – path to the original video (e.g. `/input/base.mkv`)
+- **Transcoded folder**: Second argument – directory with transcoded videos (e.g. `/input/transcoded/codec/`)
+- **Output**: Use `--output /output/results.txt` to write results to a file accessible outside the container

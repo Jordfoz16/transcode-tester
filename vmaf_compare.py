@@ -7,20 +7,11 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
 from datetime import timedelta
-
-try:
-    import select
-    import termios
-    import tty
-    _TTY_AVAILABLE = True
-except ImportError:
-    _TTY_AVAILABLE = False
 
 from rich.console import Console
 from rich.progress import BarColumn, Progress, ProgressColumn, TaskProgressColumn, TextColumn
@@ -36,29 +27,6 @@ DEFAULT_EXTENSIONS = ("mkv", "mp4", "webm", "mov")
 def _parse_ts(h: str, m: str, s: str) -> float:
     """Convert HH:MM:SS.xx timestamp components to total seconds."""
     return int(h) * 3600 + int(m) * 60 + float(s)
-
-
-def _keyboard_listener(quit_event: threading.Event) -> None:
-    """Background thread: watch for 'q' keypress and set quit_event.
-
-    Puts stdin in raw (unbuffered, no-echo) mode so the keypress is detected
-    immediately without requiring Enter. Terminal settings are always restored
-    in the finally block, including if the thread is forcibly stopped.
-    """
-    if not (_TTY_AVAILABLE and sys.stdin.isatty()):
-        return
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-    try:
-        tty.setcbreak(fd)
-        while not quit_event.is_set():
-            if select.select([sys.stdin], [], [], 0.1)[0]:
-                ch = sys.stdin.read(1)
-                if ch.lower() in ("q", "\x03"):  # q or Ctrl-C
-                    quit_event.set()
-                    break
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 class ParallelTimeRemainingColumn(ProgressColumn):
@@ -163,14 +131,12 @@ def run_vmaf(
     transcoded: Path,
     threads: int = 0,
     progress_callback: Optional[Callable[[float, float], None]] = None,
-    cancel_event: Optional[threading.Event] = None,
 ) -> Optional[float]:
     """Run ffmpeg libvmaf and return the VMAF score, or None on failure.
 
     progress_callback(current_sec, total_sec) is called for each ffmpeg
     progress line so the caller can update a progress bar in real time.
     threads=0 lets ffmpeg choose automatically.
-    cancel_event, when set, terminates the ffmpeg process immediately.
     """
     cmd = [
         "ffmpeg",
@@ -193,12 +159,6 @@ def run_vmaf(
         vmaf_score = None
         total_duration: Optional[float] = None
         for line in proc.stderr:
-            # Check for cancellation after each line (ffmpeg emits ~2 lines/sec)
-            if cancel_event is not None and cancel_event.is_set():
-                proc.terminate()
-                proc.wait()
-                return None
-
             # Capture total duration from the first Input block
             if total_duration is None:
                 m = DURATION_RE.search(line)
@@ -266,13 +226,9 @@ def main() -> int:
         type=Path,
         default=None,
         metavar="FILE",
-        help="Write results to file (plain text)",
+        help="Write results to file (plain text) in addition to printing to the terminal",
     )
     args = parser.parse_args()
-
-    # Disable progress bar when writing to file (cleaner output)
-    if args.output is not None:
-        args.no_progress = True
 
     console = Console()
 
@@ -310,15 +266,6 @@ def main() -> int:
     cpu_count = os.cpu_count() or 1
     threads_per_job = max(1, cpu_count // jobs)
 
-    # Quit event: set by keyboard listener ('q') or after work completes
-    quit_event = threading.Event()
-    use_keyboard = _TTY_AVAILABLE and sys.stdin.isatty() and not args.no_progress
-    listener_thread = threading.Thread(
-        target=_keyboard_listener, args=(quit_event,), daemon=True
-    )
-    if use_keyboard:
-        listener_thread.start()
-
     # Pre-fetch durations for all transcoded files in parallel (fast ffprobe, no decode)
     if not args.no_progress:
         console.print("[dim]Scanning file durations…[/dim]")
@@ -338,120 +285,96 @@ def main() -> int:
         ParallelTimeRemainingColumn(),
     )
 
-    if use_keyboard:
-        console.print("[dim]Press [bold]q[/bold] to cancel[/dim]")
+    with Progress(*progress_columns, console=console, disable=args.no_progress) as progress:
+        if use_duration_mode:
+            overall_task = progress.add_task(
+                f"Computing VMAF (0/{total_files} files)",
+                total=total_duration,
+            )
+        else:
+            overall_task = progress.add_task(
+                f"Computing VMAF (0/{total_files} files, {total_files} left)",
+                total=total_files,
+            )
 
-    cancelled = False
-    try:
-        with Progress(*progress_columns, console=console, disable=args.no_progress) as progress:
-            if use_duration_mode:
-                overall_task = progress.add_task(
-                    f"Computing VMAF (0/{total_files} files)",
-                    total=total_duration,
-                )
-            else:
-                overall_task = progress.add_task(
-                    f"Computing VMAF (0/{total_files} files, {total_files} left)",
-                    total=total_files,
-                )
+        def process_file(transcoded: Path) -> dict:
+            """Run VMAF on one file, reporting real-time progress, and return its result dict."""
+            file_duration = durations.get(transcoded)
+            last_reported = [0.0]
 
-            def process_file(transcoded: Path) -> dict:
-                """Run VMAF on one file, reporting real-time progress, and return its result dict."""
-                file_duration = durations.get(transcoded)
-                last_reported = [0.0]
+            # Per-file transient sub-task
+            file_task = progress.add_task(
+                f"  [dim]{transcoded.name}[/dim]",
+                total=file_duration if file_duration else 100,
+                visible=not args.no_progress,
+            )
 
-                # Per-file transient sub-task
-                file_task = progress.add_task(
-                    f"  [dim]{transcoded.name}[/dim]",
-                    total=file_duration if file_duration else 100,
-                    visible=not args.no_progress,
-                )
+            def on_progress(current_sec: float, _total_sec: float) -> None:
+                delta = current_sec - last_reported[0]
+                if delta <= 0:
+                    return
+                last_reported[0] = current_sec
+                if use_duration_mode:
+                    progress.advance(overall_task, delta)
+                progress.update(file_task, completed=current_sec)
 
-                def on_progress(current_sec: float, _total_sec: float) -> None:
-                    delta = current_sec - last_reported[0]
-                    if delta <= 0:
-                        return
-                    last_reported[0] = current_sec
-                    if use_duration_mode:
-                        progress.advance(overall_task, delta)
-                    progress.update(file_task, completed=current_sec)
+            vmaf_score = run_vmaf(
+                args.source,
+                transcoded,
+                threads=threads_per_job,
+                progress_callback=on_progress if not args.no_progress else None,
+            )
 
-                vmaf_score = run_vmaf(
-                    args.source,
-                    transcoded,
-                    threads=threads_per_job,
-                    progress_callback=on_progress if not args.no_progress else None,
-                    cancel_event=quit_event,
-                )
+            # Advance overall task for any unaccounted duration (e.g. no progress events)
+            if use_duration_mode and file_duration is not None:
+                remaining = file_duration - last_reported[0]
+                if remaining > 0:
+                    progress.advance(overall_task, remaining)
+            elif not use_duration_mode:
+                progress.advance(overall_task, 1)
 
-                # Advance overall task for any unaccounted duration (e.g. no progress events)
-                if use_duration_mode and file_duration is not None:
-                    remaining = file_duration - last_reported[0]
-                    if remaining > 0:
-                        progress.advance(overall_task, remaining)
-                elif not use_duration_mode:
-                    progress.advance(overall_task, 1)
+            progress.remove_task(file_task)
 
-                progress.remove_task(file_task)
+            transcoded_size = transcoded.stat().st_size
+            compression_ratio = source_size / transcoded_size if transcoded_size > 0 else 0
+            data_saved = source_size - transcoded_size
+            codec = get_codec(transcoded)
 
-                transcoded_size = transcoded.stat().st_size
-                compression_ratio = source_size / transcoded_size if transcoded_size > 0 else 0
-                data_saved = source_size - transcoded_size
-                codec = get_codec(transcoded)
+            result = {
+                "filename": transcoded.name,
+                "codec": codec,
+                "compression_ratio": compression_ratio,
+                "file_size": transcoded_size,
+                "data_saved": data_saved,
+                "vmaf_score": vmaf_score,
+            }
 
-                result = {
-                    "filename": transcoded.name,
-                    "codec": codec,
-                    "compression_ratio": compression_ratio,
-                    "file_size": transcoded_size,
-                    "data_saved": data_saved,
-                    "vmaf_score": vmaf_score,
-                }
+            completed_count = len(results) + 1
+            score_str = f"{vmaf_score:.2f}" if vmaf_score is not None else "ERROR"
+            progress.console.log(
+                f"[green]✓[/green] {transcoded.name}  "
+                f"[bold]VMAF:[/bold] {score_str}  "
+                f"({completed_count}/{total_files})"
+            )
 
-                # Only log completion when not cancelled
-                if not quit_event.is_set():
-                    completed_count = len(results) + 1
-                    score_str = f"{vmaf_score:.2f}" if vmaf_score is not None else "ERROR"
-                    progress.console.log(
-                        f"[green]✓[/green] {transcoded.name}  "
-                        f"[bold]VMAF:[/bold] {score_str}  "
-                        f"({completed_count}/{total_files})"
+            return result
+
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = {executor.submit(process_file, t): t for t in transcoded_files}
+            for future in as_completed(futures):
+                results.append(future.result())
+                completed = len(results)
+                left = total_files - completed
+                if use_duration_mode:
+                    progress.update(
+                        overall_task,
+                        description=f"Computing VMAF ({completed}/{total_files} files)",
                     )
-
-                return result
-
-            with ThreadPoolExecutor(max_workers=jobs) as executor:
-                futures = {executor.submit(process_file, t): t for t in transcoded_files}
-                for future in as_completed(futures):
-                    if quit_event.is_set():
-                        # Cancel any futures that haven't started yet
-                        for f in futures:
-                            f.cancel()
-                        cancelled = True
-                        break
-                    results.append(future.result())
-                    completed = len(results)
-                    left = total_files - completed
-                    if use_duration_mode:
-                        progress.update(
-                            overall_task,
-                            description=f"Computing VMAF ({completed}/{total_files} files)",
-                        )
-                    else:
-                        progress.update(
-                            overall_task,
-                            description=f"Computing VMAF ({completed}/{total_files} files, {left} left)",
-                        )
-
-            if cancelled:
-                progress.console.log(
-                    f"[yellow]Cancelled — {len(results)}/{total_files} file(s) completed[/yellow]"
-                )
-    finally:
-        # Always stop the keyboard listener and restore terminal state
-        quit_event.set()
-        if use_keyboard:
-            listener_thread.join(timeout=0.5)
+                else:
+                    progress.update(
+                        overall_task,
+                        description=f"Computing VMAF ({completed}/{total_files} files, {left} left)",
+                    )
 
     # Sort results; put failures (None) at end for numeric sorts
     sort_key = args.sort
@@ -510,7 +433,7 @@ def main() -> int:
             out_console.print()
             out_console.print(table)
 
-    return 130 if cancelled else 0
+    return 0
 
 
 if __name__ == "__main__":

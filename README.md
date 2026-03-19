@@ -98,6 +98,14 @@ docker run --rm \
 
 With a local build, replace `ghcr.io/jordfoz16/transcode-tester:latest` with `vmaf-compare`.
 
+### Docker Compose
+
+```bash
+docker compose run --rm vmaf-compare
+```
+
+Uses `samples/` and `output/` as configured in [docker-compose.yml](docker-compose.yml). Edit the `command` section to change source file, transcoded path, or output location.
+
 - **Source file**: First argument – path to the original video (e.g. `/input/base.mkv`)
 - **Transcoded folder**: Second argument – directory with transcoded videos (e.g. `/input/transcoded/codec/`)
 - **Output**: Use `--output /output/results.txt` to write results to a file accessible outside the container

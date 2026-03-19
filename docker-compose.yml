@@ -1,0 +1,13 @@
+services:
+  vmaf-compare:
+    image: ghcr.io/jordfoz16/transcode-tester:latest
+    volumes:
+      - ./samples:/input:ro
+      - ./output:/output
+    command:
+      - /input/base.mkv
+      - /input/transcoded/codec/
+      - --output
+      - /output/results.txt
+    # Override source/transcoded paths or add --jobs 1 for single-threaded:
+    # command: ["/input/your_source.mkv", "/input/your_transcoded/", "--output", "/output/results.txt"]

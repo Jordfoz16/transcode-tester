@@ -4,6 +4,8 @@ services:
     volumes:
       - ./samples:/input:ro
       - ./output:/output
+      # Mount host /transcode (e.g. NFS) so container can access film library
+      - /transcode:/transcode:ro
     command:
       - /input/base.mkv
       - /input/transcoded/codec/
